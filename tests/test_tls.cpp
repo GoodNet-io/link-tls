@@ -13,7 +13,7 @@
 #include <thread>
 #include <vector>
 
-#include <plugins/links/tls/tls.hpp>
+#include <tls.hpp>
 
 #include <tests/support/test_self_signed_cert.hpp>
 
