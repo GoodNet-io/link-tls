@@ -109,6 +109,7 @@ private:
 
     void register_session(gn_conn_id_t id, std::shared_ptr<Session> s);
     void erase_session(gn_conn_id_t id);
+    [[nodiscard]] bool claim_disconnect(gn_conn_id_t id);
     [[nodiscard]] std::shared_ptr<Session> find_session(gn_conn_id_t id) const;
 
     [[nodiscard]] static gn_trust_class_t resolve_trust(
@@ -135,6 +136,16 @@ private:
 
     mutable std::mutex                                                  sessions_mu_;
     std::unordered_map<gn_conn_id_t, std::shared_ptr<Session>>          sessions_;
+    /// Append-only log of every conn id ever published through
+    /// `notify_connect`. The worker callbacks never touch this list;
+    /// only `register_session` (under `sessions_mu_`) appends and
+    /// `shutdown` moves it out under the same lock. Lets the
+    /// caller-thread emit on shutdown reach every conn even when a
+    /// worker callback already raced ahead of shutdown and erased
+    /// the live entry. The double-emit is benign: the kernel
+    /// resolves the second call through `GN_ERR_NOT_FOUND` per
+    /// `host_api_builder.cpp` thunk_notify_disconnect §1604.
+    std::vector<gn_conn_id_t>                                           published_ids_;
 
     std::atomic<std::uint64_t> bytes_in_{0};
     std::atomic<std::uint64_t> bytes_out_{0};

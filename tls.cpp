@@ -78,12 +78,12 @@ public:
                     auto t = self->transport_.lock();
                     if (!t) return;
                     if (ec) {
-                        if (t->api_ && t->api_->notify_disconnect) {
+                        if (t->claim_disconnect(self->conn_id) &&
+                            t->api_ && t->api_->notify_disconnect) {
                             t->api_->notify_disconnect(
                                 t->api_->host_ctx, self->conn_id,
                                 ec == asio::error::eof ? GN_OK : GN_ERR_NULL_ARG);
                         }
-                        t->erase_session(self->conn_id);
                         return;
                     }
                     if (n > 0) {
@@ -102,12 +102,12 @@ public:
                                     self->host_api_failures_.fetch_add(
                                         1, std::memory_order_relaxed) + 1;
                                 if (fails >= 16) {
-                                    if (t->api_->notify_disconnect) {
+                                    if (t->claim_disconnect(self->conn_id) &&
+                                        t->api_->notify_disconnect) {
                                         (void)t->api_->notify_disconnect(
                                             t->api_->host_ctx,
                                             self->conn_id, GN_OK);
                                     }
-                                    t->erase_session(self->conn_id);
                                     return;
                                 }
                             }
@@ -230,11 +230,11 @@ private:
                     auto t = self->transport_.lock();
                     if (!t) return;
                     if (ec) {
-                        if (t->api_ && t->api_->notify_disconnect) {
+                        if (t->claim_disconnect(self->conn_id) &&
+                            t->api_ && t->api_->notify_disconnect) {
                             t->api_->notify_disconnect(
                                 t->api_->host_ctx, self->conn_id, GN_ERR_NULL_ARG);
                         }
-                        t->erase_session(self->conn_id);
                         return;
                     }
                     t->bytes_out_.fetch_add(n, std::memory_order_relaxed);
@@ -245,11 +245,11 @@ private:
 
     void fail() {
         auto t = transport_.lock();
-        if (t && t->api_ && t->api_->notify_disconnect &&
-            conn_id != GN_INVALID_ID) {
+        if (t && conn_id != GN_INVALID_ID &&
+            t->claim_disconnect(conn_id) &&
+            t->api_ && t->api_->notify_disconnect) {
             t->api_->notify_disconnect(t->api_->host_ctx, conn_id, GN_OK);
         }
-        if (t && conn_id != GN_INVALID_ID) t->erase_session(conn_id);
         std::error_code ec;
         if (lowest_layer().close(ec)) {}
     }
@@ -800,11 +800,24 @@ void TlsLink::register_session(gn_conn_id_t id,
                                      std::shared_ptr<Session> s) {
     std::lock_guard lk(sessions_mu_);
     sessions_[id] = std::move(s);
+    /// `published_ids_` mirrors every successful `notify_connect` so
+    /// shutdown's caller-thread emit reaches the conn even when a
+    /// worker callback already erased the live entry between the
+    /// callback's `claim_disconnect` and shutdown's snapshot. Append
+    /// is under the same lock as the live-map insert so the two
+    /// stay coherent.
+    published_ids_.push_back(id);
 }
 
 void TlsLink::erase_session(gn_conn_id_t id) {
     std::lock_guard lk(sessions_mu_);
     sessions_.erase(id);
+}
+
+bool TlsLink::claim_disconnect(gn_conn_id_t id) {
+    std::lock_guard lk(sessions_mu_);
+    if (shutdown_.load(std::memory_order_acquire)) return false;
+    return sessions_.erase(id) > 0;
 }
 
 std::shared_ptr<TlsLink::Session>
@@ -815,17 +828,6 @@ TlsLink::find_session(gn_conn_id_t id) const {
 }
 
 void TlsLink::shutdown() {
-    if (shutdown_.exchange(true, std::memory_order_acq_rel)) return;
-
-    if (acceptor_) {
-        std::error_code ec;
-        if (acceptor_->close(ec) && api_) {
-            gn_log_debug(api_, "tls: acceptor close failed: %s",
-                         ec.message().c_str());
-        }
-        acceptor_.reset();
-    }
-
     /// Snapshot conn ids under the lock, close each session's
     /// socket synchronously, then notify the kernel side
     /// SYNCHRONOUSLY for each session before stopping the
@@ -836,19 +838,50 @@ void TlsLink::shutdown() {
     /// records past tls shutdown, which in turn keeps the security
     /// plugin's lifetime anchor alive past the PluginManager drain
     /// budget. Per `link.md` §9.
-    std::vector<gn_conn_id_t> live_ids;
+    bool first_call = false;
+    std::vector<gn_conn_id_t> ids_to_emit;
     {
+        /// `shutdown_`'s atomic exchange is published under
+        /// `sessions_mu_` so a worker-thread `claim_disconnect`
+        /// that races with shutdown observes the flag under the
+        /// same lock and skips its own emit. Without the lock-
+        /// bracketed publish, the worker could erase a session
+        /// between shutdown's exchange and snapshot, dropping the
+        /// kernel's only release event for that conn (link.md §9
+        /// step 3).
         std::lock_guard lk(sessions_mu_);
-        live_ids.reserve(sessions_.size());
-        for (auto& [id, s] : sessions_) {
-            live_ids.push_back(id);
-            s->do_close();
+        if (!shutdown_.exchange(true, std::memory_order_acq_rel)) {
+            first_call = true;
+            for (auto& [id, s] : sessions_) {
+                s->do_close();
+            }
+            sessions_.clear();
+            /// Move `published_ids_` out — caller-thread emit walks
+            /// every conn ever notify_connect'd, not just the conns
+            /// still live at shutdown. A worker callback that ran
+            /// just before shutdown's lock acquisition (Case A) had
+            /// already erased its session and emitted its own
+            /// notify_disconnect; the second emit on the caller
+            /// thread is harmless because the kernel resolves it
+            /// through `GN_ERR_NOT_FOUND` and does not re-fire the
+            /// DISCONNECTED conn-event.
+            ids_to_emit = std::move(published_ids_);
         }
-        sessions_.clear();
+    }
+
+    if (!first_call) return;
+
+    if (acceptor_) {
+        std::error_code ec;
+        if (acceptor_->close(ec) && api_) {
+            gn_log_debug(api_, "tls: acceptor close failed: %s",
+                         ec.message().c_str());
+        }
+        acceptor_.reset();
     }
 
     if (api_ && api_->notify_disconnect) {
-        for (const auto id : live_ids) {
+        for (const auto id : ids_to_emit) {
             (void)api_->notify_disconnect(api_->host_ctx, id, GN_OK);
         }
     }
