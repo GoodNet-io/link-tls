@@ -1,7 +1,9 @@
 # TLS link plugin unit tests — Apache 2.0.
 include(GoogleTest)
 
-add_executable(test_tls test_tls.cpp)
+add_executable(test_tls
+    test_tls.cpp
+    test_tls_conformance.cpp)
 target_link_libraries(test_tls PRIVATE
     GoodNet::sdk
     goodnet_tls_objects
