@@ -1,0 +1,11 @@
+# Local override for the TLS plugin only. asio::ssl::stream's
+# templated state machine confuses the path-sensitive analyzer's
+# `NewDeleteLeaks` (cannot trace SSL_free through async_handshake)
+# and `BlockInCriticalSection` (asio's internal mutex pattern around
+# blocking recv calls is a documented design, not a bug we can
+# unwind from outside the library). Both checks stay enabled
+# project-wide — only this directory inherits the exclusion.
+InheritParentConfig: true
+Checks: >
+  -clang-analyzer-cplusplus.NewDeleteLeaks,
+  -clang-analyzer-unix.BlockInCriticalSection
