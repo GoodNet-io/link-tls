@@ -800,6 +800,13 @@ void TlsLink::register_session(gn_conn_id_t id,
                                      std::shared_ptr<Session> s) {
     std::lock_guard lk(sessions_mu_);
     sessions_[id] = std::move(s);
+    /// `published_ids_` mirrors every successful `notify_connect` so
+    /// shutdown's caller-thread emit reaches the conn even when a
+    /// worker callback already erased the live entry between the
+    /// callback's `claim_disconnect` and shutdown's snapshot. Append
+    /// is under the same lock as the live-map insert so the two
+    /// stay coherent.
+    published_ids_.push_back(id);
 }
 
 void TlsLink::erase_session(gn_conn_id_t id) {
@@ -832,7 +839,7 @@ void TlsLink::shutdown() {
     /// plugin's lifetime anchor alive past the PluginManager drain
     /// budget. Per `link.md` §9.
     bool first_call = false;
-    std::vector<gn_conn_id_t> live_ids;
+    std::vector<gn_conn_id_t> ids_to_emit;
     {
         /// `shutdown_`'s atomic exchange is published under
         /// `sessions_mu_` so a worker-thread `claim_disconnect`
@@ -845,12 +852,20 @@ void TlsLink::shutdown() {
         std::lock_guard lk(sessions_mu_);
         if (!shutdown_.exchange(true, std::memory_order_acq_rel)) {
             first_call = true;
-            live_ids.reserve(sessions_.size());
             for (auto& [id, s] : sessions_) {
-                live_ids.push_back(id);
                 s->do_close();
             }
             sessions_.clear();
+            /// Move `published_ids_` out — caller-thread emit walks
+            /// every conn ever notify_connect'd, not just the conns
+            /// still live at shutdown. A worker callback that ran
+            /// just before shutdown's lock acquisition (Case A) had
+            /// already erased its session and emitted its own
+            /// notify_disconnect; the second emit on the caller
+            /// thread is harmless because the kernel resolves it
+            /// through `GN_ERR_NOT_FOUND` and does not re-fire the
+            /// DISCONNECTED conn-event.
+            ids_to_emit = std::move(published_ids_);
         }
     }
 
@@ -866,7 +881,7 @@ void TlsLink::shutdown() {
     }
 
     if (api_ && api_->notify_disconnect) {
-        for (const auto id : live_ids) {
+        for (const auto id : ids_to_emit) {
             (void)api_->notify_disconnect(api_->host_ctx, id, GN_OK);
         }
     }
