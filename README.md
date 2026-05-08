@@ -30,11 +30,11 @@ cmake --build build
 
 Manifest entry pins the SHA-256 digest; `gn_plugin_init` registers
 the `tls` scheme. See `docs/install.md` and
-`docs/contracts/plugin-manifest.md` in the kernel tree.
+`docs/contracts/plugin-manifest.en.md` in the kernel tree.
 
 ## Contract
 
-- Kernel-side link contract: `docs/contracts/link.md`
+- Kernel-side link contract: `docs/contracts/link.en.md`
 - Wipe-on-end-of-life rule for the override key:
   `plugins/security/noise/docs/handshake.md` §5b (canonical statement,
   cross-applies to this plugin's TLS key buffer).
