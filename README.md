@@ -11,25 +11,25 @@ OpenSSL has copied them into the SSL context.
 
 ## Build
 
-In-tree, alongside the kernel:
+This plugin lives in its own git with a flake that pulls the
+kernel SDK as a Nix input (OpenSSL ≥ 3 on the build path). From
+this checkout:
 
 ```sh
-nix build .#goodnet-link-tls
-# result/lib/goodnet/plugins/libgoodnet_link_tls.so
+nix run .#build         # release build of libgoodnet_link_tls.so
+nix run .#test          # vanilla ctest
+nix run .#test-asan     # AddressSanitizer + UBSan
+nix run .#test-tsan     # ThreadSanitizer
 ```
 
-Standalone, against an installed kernel SDK (OpenSSL ≥ 3 on PATH):
-
-```sh
-cd plugins/links/tls
-cmake -B build -DCMAKE_PREFIX_PATH=/usr/local -DBUILD_TESTING=OFF
-cmake --build build
-```
+The kernel monorepo also builds this plugin in-tree through its
+own `nix run .#build -- release` — operator install consumes
+every bundled `.so` from there.
 
 ## Load
 
 Manifest entry pins the SHA-256 digest; `gn_plugin_init` registers
-the `tls` scheme. See `docs/install.md` and
+the `tls` scheme. See `docs/install.en.md` and
 `docs/contracts/plugin-manifest.en.md` in the kernel tree.
 
 ## Contract
