@@ -19,10 +19,12 @@
 
 #include <array>
 #include <cstring>
+#include <algorithm>
 #include <deque>
 #include <exception>
 #include <span>
 #include <sstream>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -304,7 +306,15 @@ TlsLink::TlsLink()
     /// invariant holds even if `set_host_api` never runs.
     client_ctx_.set_verify_mode(asio::ssl::verify_peer);
 
-    worker_ = std::thread([this] { ioc_.run(); });
+    /// Worker pool sized symmetrically with the other link plugins;
+    /// per-Session strands keep the per-conn `SSL*` access
+    /// single-threaded.
+    const unsigned hc = std::thread::hardware_concurrency();
+    const unsigned n  = std::max(1u, hc / 2);
+    workers_.reserve(n);
+    for (unsigned i = 0; i < n; ++i) {
+        workers_.emplace_back([this] { ioc_.run(); });
+    }
 }
 
 TlsLink::~TlsLink() {
@@ -888,7 +898,10 @@ void TlsLink::shutdown() {
 
     work_.reset();
     ioc_.stop();
-    if (worker_.joinable()) worker_.join();
+    for (auto& w : workers_) {
+        if (w.joinable()) w.join();
+    }
+    workers_.clear();
 }
 
 } // namespace gn::link::tls

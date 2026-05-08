@@ -126,7 +126,13 @@ private:
 
     asio::io_context                                                 ioc_;
     asio::executor_work_guard<asio::io_context::executor_type>       work_;
-    std::thread                                                      worker_;
+    /// Multiple workers run the same `io_context`. Per-Session
+    /// strands serialise OpenSSL state per connection — `SSL*`
+    /// objects are not thread-safe, but the strand keeps every
+    /// `async_write_some` / `async_read_some` on a single thread
+    /// at a time. Extra threads add parallelism across
+    /// connections. See `docs/impl/cpp/transports.ru.md`.
+    std::vector<std::thread>                                         workers_;
     asio::ssl::context                                               server_ctx_;
     asio::ssl::context                                               client_ctx_;
 
