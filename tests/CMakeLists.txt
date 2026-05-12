@@ -3,7 +3,8 @@ include(GoogleTest)
 
 add_executable(test_tls
     test_tls.cpp
-    test_tls_conformance.cpp)
+    test_tls_conformance.cpp
+    test_composer.cpp)
 target_link_libraries(test_tls PRIVATE
     GoodNet::sdk
     goodnet_tls_objects
