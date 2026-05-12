@@ -272,6 +272,209 @@ private:
     std::atomic<std::uint32_t>                          host_api_failures_{0};
 };
 
+// ── ComposerSession ──────────────────────────────────────────────────────
+//
+// L2 composer session: drives OpenSSL through a BIO_pair so the
+// encrypted byte stream travels over `gn.link.tcp` (or, later,
+// `gn.link.udp` for DTLS) via the LinkCarrier abstraction. No
+// asio::ssl::stream, no own socket — the carrier owns the raw I/O.
+//
+// Threading: every SSL/BIO op runs under `mu_`. The carrier's
+// on_data callback fires on the producer's strand (one thread per
+// L1 conn at a time per the composer contract), so contention is
+// minimal in practice; the lock exists to serialise the rare race
+// between an inbound data delivery and an outbound `do_send`
+// arriving on a different caller thread.
+class TlsLink::ComposerSession
+    : public std::enable_shared_from_this<ComposerSession> {
+public:
+    enum class Mode { Server, Client };
+
+    ComposerSession(SSL_CTX* ctx,
+                    Mode mode,
+                    gn_conn_id_t l1_id,
+                    gn_conn_id_t composer_id,
+                    std::weak_ptr<TlsLink> transport)
+        : mode_(mode),
+          l1_id_(l1_id),
+          composer_id_(composer_id),
+          transport_(std::move(transport)) {
+        ssl_ = SSL_new(ctx);
+        BIO_new_bio_pair(&internal_bio_, 0, &network_bio_, 0);
+        SSL_set_bio(ssl_, internal_bio_, internal_bio_);
+        if (mode_ == Mode::Server) SSL_set_accept_state(ssl_);
+        else                       SSL_set_connect_state(ssl_);
+    }
+
+    ComposerSession(const ComposerSession&)            = delete;
+    ComposerSession& operator=(const ComposerSession&) = delete;
+
+    ~ComposerSession() {
+        if (ssl_) {
+            SSL_free(ssl_);  // also frees internal_bio_
+            ssl_ = nullptr;
+        }
+        if (network_bio_) {
+            BIO_free(network_bio_);
+            network_bio_ = nullptr;
+        }
+    }
+
+    [[nodiscard]] gn_conn_id_t l1_id() const noexcept       { return l1_id_; }
+    [[nodiscard]] gn_conn_id_t composer_id() const noexcept { return composer_id_; }
+
+    /// Client-side kickoff. Generates the ClientHello and drains it
+    /// out to the carrier. Server-side waits for inbound bytes.
+    void kick_client_handshake(std::string peer_uri) {
+        std::lock_guard lk(mu_);
+        peer_uri_ = std::move(peer_uri);
+        (void)SSL_do_handshake(ssl_);
+        drain_to_carrier_unlocked();
+    }
+
+    /// Inbound encrypted bytes from the carrier. Drives the SSL
+    /// state machine forward; emits decrypted bytes to data
+    /// subscribers and fires accept-bus on handshake completion.
+    void feed_inbound(std::span<const std::uint8_t> bytes,
+                       std::string peer_uri) {
+        std::lock_guard lk(mu_);
+        if (peer_uri_.empty() && !peer_uri.empty()) peer_uri_ = peer_uri;
+        // Funnel inbound encrypted into network_bio.
+        if (!bytes.empty()) {
+            BIO_write(network_bio_, bytes.data(),
+                       static_cast<int>(bytes.size()));
+        }
+        // Pump the state machine: handshake first, then data reads.
+        pump_unlocked();
+    }
+
+    /// Application-level send: SSL_write → drain encrypted bytes
+    /// out of network_bio → carrier.send. Plaintext is queued when
+    /// the handshake has not completed yet.
+    gn_result_t do_send(std::span<const std::uint8_t> plain) {
+        std::lock_guard lk(mu_);
+        if (!handshake_done_) {
+            pending_writes_.emplace_back(plain.begin(), plain.end());
+            return GN_OK;
+        }
+        const int n = SSL_write(ssl_, plain.data(),
+                                  static_cast<int>(plain.size()));
+        if (n <= 0) {
+            const int err = SSL_get_error(ssl_, n);
+            if (err != SSL_ERROR_WANT_READ && err != SSL_ERROR_WANT_WRITE) {
+                closed_ = true;
+                return GN_ERR_NULL_ARG;
+            }
+        }
+        drain_to_carrier_unlocked();
+        return GN_OK;
+    }
+
+    void do_close() {
+        std::lock_guard lk(mu_);
+        if (closed_) return;
+        closed_ = true;
+        (void)SSL_shutdown(ssl_);
+        drain_to_carrier_unlocked();
+        auto t = transport_.lock();
+        if (t && t->carrier_) {
+            (void)t->carrier_->disconnect(l1_id_);
+        }
+    }
+
+private:
+    /// Run the SSL state machine: complete handshake if pending,
+    /// then read every plaintext chunk available, fire data cb for
+    /// each, then drain encrypted bytes outward.
+    void pump_unlocked() {
+        if (!handshake_done_) {
+            const int r = SSL_do_handshake(ssl_);
+            if (r == 1) {
+                handshake_done_ = true;
+                drain_to_carrier_unlocked();
+                auto t = transport_.lock();
+                if (t) {
+                    t->composer_handshake_complete(composer_id_, peer_uri_);
+                }
+                // Flush queued plaintext writes.
+                for (auto& buf : pending_writes_) {
+                    (void)SSL_write(ssl_, buf.data(),
+                                     static_cast<int>(buf.size()));
+                }
+                pending_writes_.clear();
+                drain_to_carrier_unlocked();
+            } else {
+                const int err = SSL_get_error(ssl_, r);
+                drain_to_carrier_unlocked();
+                if (err != SSL_ERROR_WANT_READ &&
+                    err != SSL_ERROR_WANT_WRITE) {
+                    closed_ = true;
+                }
+                return;
+            }
+        }
+        // Drain plaintext from SSL_read.
+        std::uint8_t buf[16 * 1024];
+        while (true) {
+            const int n = SSL_read(ssl_, buf, sizeof(buf));
+            if (n > 0) {
+                deliver_plain(buf, static_cast<std::size_t>(n));
+                continue;
+            }
+            const int err = SSL_get_error(ssl_, n);
+            if (err == SSL_ERROR_WANT_READ) break;
+            if (err == SSL_ERROR_ZERO_RETURN) {
+                closed_ = true;
+                break;
+            }
+            closed_ = true;
+            break;
+        }
+        drain_to_carrier_unlocked();
+    }
+
+    void drain_to_carrier_unlocked() {
+        auto t = transport_.lock();
+        if (!t || !t->carrier_) return;
+        std::uint8_t out[16 * 1024];
+        while (BIO_pending(network_bio_) > 0) {
+            const int n = BIO_read(network_bio_, out, sizeof(out));
+            if (n <= 0) break;
+            (void)t->carrier_->send(
+                l1_id_,
+                std::span<const std::uint8_t>(out, static_cast<std::size_t>(n)));
+        }
+    }
+
+    void deliver_plain(const std::uint8_t* bytes, std::size_t n) {
+        auto t = transport_.lock();
+        if (!t) return;
+        TlsLink::ComposerDataSub sub{};
+        {
+            std::lock_guard sub_lk(t->composer_mu_);
+            auto it = t->composer_data_subs_.find(composer_id_);
+            if (it != t->composer_data_subs_.end()) sub = it->second;
+        }
+        if (sub.cb) sub.cb(sub.user_data, composer_id_, bytes, n);
+        t->bytes_in_.fetch_add(n, std::memory_order_relaxed);
+        t->frames_in_.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    Mode                                   mode_;
+    gn_conn_id_t                           l1_id_;
+    gn_conn_id_t                           composer_id_;
+    std::weak_ptr<TlsLink>                 transport_;
+
+    std::mutex                             mu_;
+    SSL*                                   ssl_           = nullptr;
+    BIO*                                   internal_bio_  = nullptr;
+    BIO*                                   network_bio_   = nullptr;
+    bool                                   handshake_done_ = false;
+    bool                                   closed_         = false;
+    std::string                            peer_uri_;
+    std::deque<std::vector<std::uint8_t>>  pending_writes_;
+};
+
 // ── TlsLink ──────────────────────────────────────────────────────────────
 
 TlsLink::TlsLink()
@@ -743,6 +946,16 @@ gn_result_t TlsLink::connect(std::string_view uri) {
 
 gn_result_t TlsLink::send(gn_conn_id_t conn,
                                 std::span<const std::uint8_t> bytes) {
+    if (conn & kComposerIdBit) {
+        std::shared_ptr<ComposerSession> cs;
+        {
+            std::lock_guard lk(composer_mu_);
+            auto it = composer_sessions_.find(conn);
+            if (it == composer_sessions_.end()) return GN_ERR_NOT_FOUND;
+            cs = it->second;
+        }
+        return cs->do_send(bytes);
+    }
     auto session = find_session(conn);
     if (!session) return GN_ERR_NOT_FOUND;
     if (pending_queue_bytes_hard_ != 0 &&
@@ -770,6 +983,16 @@ gn_result_t TlsLink::send_batch(
     std::span<const std::span<const std::uint8_t>> frames) {
     if (frames.empty()) return GN_OK;
     if (frames.size() == 1) return send(conn, frames[0]);
+    if (conn & kComposerIdBit) {
+        // Composer path coalesces the batch into one SSL_write —
+        // the consumer (WSS, ICE, ...) applies its own framing.
+        std::vector<std::uint8_t> flat;
+        std::size_t total = 0;
+        for (const auto& f : frames) total += f.size();
+        flat.reserve(total);
+        for (const auto& f : frames) flat.insert(flat.end(), f.begin(), f.end());
+        return send(conn, std::span<const std::uint8_t>(flat));
+    }
     auto session = find_session(conn);
     if (!session) return GN_ERR_NOT_FOUND;
     std::size_t total = 0;
@@ -794,6 +1017,20 @@ gn_result_t TlsLink::send_batch(
 }
 
 gn_result_t TlsLink::disconnect(gn_conn_id_t conn) {
+    if (conn & kComposerIdBit) {
+        std::shared_ptr<ComposerSession> cs;
+        {
+            std::lock_guard lk(composer_mu_);
+            auto it = composer_sessions_.find(conn);
+            if (it == composer_sessions_.end()) return GN_OK;
+            cs = std::move(it->second);
+            l1_to_composer_.erase(cs->l1_id());
+            composer_sessions_.erase(it);
+            composer_data_subs_.erase(conn);
+        }
+        cs->do_close();
+        return GN_OK;
+    }
     std::shared_ptr<Session> session;
     {
         std::lock_guard lk(sessions_mu_);
@@ -804,6 +1041,201 @@ gn_result_t TlsLink::disconnect(gn_conn_id_t conn) {
     }
     session->do_close();
     return GN_OK;
+}
+
+// ── Composer L2 surface ─────────────────────────────────────────────────
+
+gn_result_t TlsLink::ensure_carrier(std::string_view scheme) {
+    if (carrier_) {
+        if (!carrier_scheme_.empty() && carrier_scheme_ != scheme) {
+            return GN_ERR_INVALID_STATE;
+        }
+        return GN_OK;
+    }
+    if (!api_) return GN_ERR_INVALID_STATE;
+    auto opt = gn::sdk::LinkCarrier::query(api_, scheme);
+    if (!opt) return GN_ERR_NOT_FOUND;
+    carrier_.emplace(std::move(*opt));
+    carrier_scheme_ = std::string(scheme);
+    return GN_OK;
+}
+
+gn_result_t TlsLink::composer_listen(std::string_view uri) {
+    if (shutdown_.load(std::memory_order_acquire)) {
+        return GN_ERR_INVALID_STATE;
+    }
+    // For TLS-on-TCP: carrier scheme is "tcp", carrier URI substitutes
+    // the scheme prefix. DTLS-on-UDP polarises this to "udp" later.
+    if (!uri.starts_with("tls://")) return GN_ERR_INVALID_ENVELOPE;
+    if (const auto rc = ensure_carrier("tcp"); rc != GN_OK) return rc;
+    if (!load_server_credentials()) return GN_ERR_NULL_ARG;
+
+    const std::string l1_uri =
+        std::string("tcp://") + std::string(uri.substr(6));
+
+    auto self_weak = weak_from_this();
+    const auto rc = carrier_->on_accept(
+        [self_weak](gn_conn_id_t l1, std::string_view peer_uri) {
+            if (auto t = self_weak.lock()) {
+                t->composer_on_l1_accept(l1, peer_uri);
+            }
+        });
+    if (rc != GN_OK) return rc;
+    return carrier_->listen(l1_uri);
+}
+
+gn_result_t TlsLink::composer_connect(std::string_view uri,
+                                       gn_conn_id_t* out_conn) {
+    if (!out_conn) return GN_ERR_NULL_ARG;
+    *out_conn = GN_INVALID_ID;
+    if (shutdown_.load(std::memory_order_acquire)) {
+        return GN_ERR_INVALID_STATE;
+    }
+    if (!uri.starts_with("tls://")) return GN_ERR_INVALID_ENVELOPE;
+    if (const auto rc = ensure_carrier("tcp"); rc != GN_OK) return rc;
+    const std::string l1_uri =
+        std::string("tcp://") + std::string(uri.substr(6));
+
+    gn_conn_id_t l1 = GN_INVALID_ID;
+    const auto rc = carrier_->connect(l1_uri, &l1);
+    if (rc != GN_OK) return rc;
+
+    const gn_conn_id_t composer_id =
+        next_composer_id_.fetch_add(1, std::memory_order_relaxed) |
+        kComposerIdBit;
+    auto cs = std::make_shared<ComposerSession>(
+        client_ctx_.native_handle(), ComposerSession::Mode::Client,
+        l1, composer_id, weak_from_this());
+    {
+        std::lock_guard lk(composer_mu_);
+        composer_sessions_[composer_id] = cs;
+        l1_to_composer_[l1] = composer_id;
+    }
+    auto self_weak = weak_from_this();
+    (void)carrier_->on_data(
+        l1,
+        [self_weak](gn_conn_id_t lid,
+                    std::span<const std::uint8_t> bytes) {
+            if (auto t = self_weak.lock()) {
+                t->composer_on_l1_data(lid, bytes);
+            }
+        });
+    cs->kick_client_handshake(std::string(uri));
+    *out_conn = composer_id;
+    return GN_OK;
+}
+
+gn_result_t TlsLink::composer_subscribe_data(gn_conn_id_t conn,
+                                              ::gn_link_data_cb_t cb,
+                                              void* user_data) {
+    if (!cb) return GN_ERR_NULL_ARG;
+    if (!(conn & kComposerIdBit)) return GN_ERR_NOT_FOUND;
+    std::lock_guard lk(composer_mu_);
+    if (composer_sessions_.find(conn) == composer_sessions_.end()) {
+        return GN_ERR_NOT_FOUND;
+    }
+    composer_data_subs_[conn] = ComposerDataSub{cb, user_data};
+    return GN_OK;
+}
+
+gn_result_t TlsLink::composer_unsubscribe_data(gn_conn_id_t conn) {
+    if (!(conn & kComposerIdBit)) return GN_OK;
+    std::lock_guard lk(composer_mu_);
+    composer_data_subs_.erase(conn);
+    return GN_OK;
+}
+
+gn_result_t TlsLink::composer_subscribe_accept(
+    ::gn_link_accept_cb_t cb,
+    void* user_data,
+    gn_subscription_id_t* out_token) {
+    if (!cb || !out_token) return GN_ERR_NULL_ARG;
+    const gn_subscription_id_t token =
+        next_accept_token_.fetch_add(1, std::memory_order_relaxed);
+    std::lock_guard lk(composer_mu_);
+    composer_accept_subs_.push_back(
+        ComposerAcceptSub{token, cb, user_data});
+    *out_token = token;
+    return GN_OK;
+}
+
+gn_result_t TlsLink::composer_unsubscribe_accept(
+    gn_subscription_id_t token) {
+    std::lock_guard lk(composer_mu_);
+    auto it = std::remove_if(
+        composer_accept_subs_.begin(), composer_accept_subs_.end(),
+        [token](const ComposerAcceptSub& s) { return s.token == token; });
+    composer_accept_subs_.erase(it, composer_accept_subs_.end());
+    return GN_OK;
+}
+
+void TlsLink::composer_on_l1_accept(gn_conn_id_t l1,
+                                     std::string_view peer_uri) {
+    const gn_conn_id_t composer_id =
+        next_composer_id_.fetch_add(1, std::memory_order_relaxed) |
+        kComposerIdBit;
+    auto cs = std::make_shared<ComposerSession>(
+        server_ctx_.native_handle(), ComposerSession::Mode::Server,
+        l1, composer_id, weak_from_this());
+    {
+        std::lock_guard lk(composer_mu_);
+        composer_sessions_[composer_id] = cs;
+        l1_to_composer_[l1] = composer_id;
+    }
+    auto self_weak = weak_from_this();
+    if (carrier_) {
+        (void)carrier_->on_data(
+            l1,
+            [self_weak](gn_conn_id_t lid,
+                        std::span<const std::uint8_t> bytes) {
+                if (auto t = self_weak.lock()) {
+                    t->composer_on_l1_data(lid, bytes);
+                }
+            });
+    }
+    // Stash peer_uri on the session so handshake-complete carries it
+    // through to accept-bus subscribers.
+    cs->feed_inbound({}, std::string(peer_uri));
+}
+
+void TlsLink::composer_on_l1_data(gn_conn_id_t l1,
+                                   std::span<const std::uint8_t> bytes) {
+    std::shared_ptr<ComposerSession> cs;
+    {
+        std::lock_guard lk(composer_mu_);
+        auto it = l1_to_composer_.find(l1);
+        if (it == l1_to_composer_.end()) return;
+        auto sit = composer_sessions_.find(it->second);
+        if (sit == composer_sessions_.end()) return;
+        cs = sit->second;
+    }
+    cs->feed_inbound(bytes, {});
+}
+
+void TlsLink::composer_handshake_complete(gn_conn_id_t composer_id,
+                                            std::string_view peer_uri) {
+    std::vector<ComposerAcceptSub> snapshot;
+    {
+        std::lock_guard lk(composer_mu_);
+        snapshot = composer_accept_subs_;
+    }
+    const std::string peer(peer_uri);
+    for (const auto& s : snapshot) {
+        if (s.cb) s.cb(s.user_data, composer_id, peer.c_str());
+    }
+}
+
+void TlsLink::composer_drop_session(gn_conn_id_t composer_id) {
+    std::shared_ptr<ComposerSession> cs;
+    {
+        std::lock_guard lk(composer_mu_);
+        auto it = composer_sessions_.find(composer_id);
+        if (it == composer_sessions_.end()) return;
+        cs = std::move(it->second);
+        l1_to_composer_.erase(cs->l1_id());
+        composer_sessions_.erase(it);
+        composer_data_subs_.erase(composer_id);
+    }
 }
 
 void TlsLink::register_session(gn_conn_id_t id,
@@ -888,6 +1320,26 @@ void TlsLink::shutdown() {
                          ec.message().c_str());
         }
         acceptor_.reset();
+    }
+
+    // Composer-mode teardown: drop the LinkCarrier (its dtor
+    // unsubscribes accept-bus + per-conn data subs), close every
+    // composer session.
+    {
+        std::vector<std::shared_ptr<ComposerSession>> composer_drain;
+        {
+            std::lock_guard lk(composer_mu_);
+            composer_drain.reserve(composer_sessions_.size());
+            for (auto& [_, cs] : composer_sessions_) {
+                composer_drain.push_back(cs);
+            }
+            composer_sessions_.clear();
+            l1_to_composer_.clear();
+            composer_data_subs_.clear();
+            composer_accept_subs_.clear();
+        }
+        for (auto& cs : composer_drain) cs->do_close();
+        carrier_.reset();
     }
 
     if (api_ && api_->notify_disconnect) {

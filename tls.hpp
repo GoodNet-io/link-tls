@@ -37,6 +37,7 @@
 #include <asio/ssl.hpp>
 #include <asio/strand.hpp>
 
+#include <sdk/cpp/link_carrier.hpp>
 #include <sdk/extensions/link.h>
 #include <sdk/host_api.h>
 #include <sdk/trust.h>
@@ -79,6 +80,27 @@ public:
 
     [[nodiscard]] static gn_link_caps_t capabilities() noexcept;
 
+    /// Composer L2 surface. TlsLink layers TLS over a lower-layer
+    /// carrier (currently `gn.link.tcp`; DTLS over `gn.link.udp`
+    /// lands when UdpLink composer impl arrives). Composer conn
+    /// ids carry `kComposerIdBit` so `send`/`disconnect` route by
+    /// range without scanning two maps — same shape as TcpLink's
+    /// kernel-vs-composer split.
+    [[nodiscard]] gn_result_t composer_listen(std::string_view uri);
+    [[nodiscard]] gn_result_t composer_connect(std::string_view uri,
+                                                gn_conn_id_t* out_conn);
+    [[nodiscard]] gn_result_t composer_subscribe_data(
+        gn_conn_id_t conn, ::gn_link_data_cb_t cb, void* user_data);
+    [[nodiscard]] gn_result_t composer_unsubscribe_data(gn_conn_id_t conn);
+    [[nodiscard]] gn_result_t composer_subscribe_accept(
+        ::gn_link_accept_cb_t cb, void* user_data,
+        gn_subscription_id_t* out_token);
+    [[nodiscard]] gn_result_t composer_unsubscribe_accept(
+        gn_subscription_id_t token);
+
+    static constexpr gn_conn_id_t kComposerIdBit =
+        gn_conn_id_t{1} << 63;
+
     /// Direct cert + key configuration for in-tree tests that
     /// instantiate the transport without a Kernel. Production
     /// loads come through `links.tls.cert_path` /
@@ -102,6 +124,17 @@ public:
 
 private:
     class Session;
+    class ComposerSession;
+
+    struct ComposerDataSub {
+        ::gn_link_data_cb_t cb        = nullptr;
+        void*               user_data = nullptr;
+    };
+    struct ComposerAcceptSub {
+        gn_subscription_id_t  token     = GN_INVALID_SUBSCRIPTION_ID;
+        ::gn_link_accept_cb_t cb        = nullptr;
+        void*                 user_data = nullptr;
+    };
 
     void start_accept();
     void on_accept(std::shared_ptr<Session> session,
@@ -172,6 +205,36 @@ private:
     std::vector<std::uint8_t>                                        override_key_pem_;
 
     const host_api_t* api_ = nullptr;
+
+    /// Composer-mode state. TlsLink layers TLS over a lower-layer
+    /// carrier (gn.link.tcp today; gn.link.udp for DTLS later).
+    /// Composer-owned sessions live in a separate map from kernel-
+    /// managed Sessions; composer conn ids carry `kComposerIdBit`.
+    /// `carrier_` is bound lazily on the first composer_listen /
+    /// composer_connect, then reused across sessions.
+    std::optional<gn::sdk::LinkCarrier>                              carrier_;
+    mutable std::mutex                                               composer_mu_;
+    std::unordered_map<gn_conn_id_t,
+                       std::shared_ptr<ComposerSession>>             composer_sessions_;
+    /// Map from L1 (carrier) conn id → composer conn id, so the
+    /// carrier's on_data callback can find the matching session.
+    std::unordered_map<gn_conn_id_t, gn_conn_id_t>                   l1_to_composer_;
+    std::unordered_map<gn_conn_id_t, ComposerDataSub>                composer_data_subs_;
+    std::vector<ComposerAcceptSub>                                   composer_accept_subs_;
+    std::atomic<std::uint64_t>                                       next_composer_id_{1};
+    std::atomic<std::uint64_t>                                       next_accept_token_{1};
+    /// `gn.link.<scheme>` carrier name once polarized — "tcp" for
+    /// tls://, "udp" for dtls:// (future DTLS slice).
+    std::string                                                      carrier_scheme_;
+
+    [[nodiscard]] gn_result_t ensure_carrier(std::string_view scheme);
+    void composer_on_l1_data(gn_conn_id_t l1,
+                              std::span<const std::uint8_t> bytes);
+    void composer_on_l1_accept(gn_conn_id_t l1,
+                                std::string_view peer_uri);
+    void composer_handshake_complete(gn_conn_id_t composer_id,
+                                      std::string_view peer_uri);
+    void composer_drop_session(gn_conn_id_t composer_id);
 };
 
 } // namespace gn::link::tls
