@@ -3,6 +3,7 @@
 /// @brief  Implementation of the TLS transport.
 
 #include "tls.hpp"
+#include "tls_composer_session.hpp"
 
 #include <sdk/convenience.h>
 #include <sdk/cpp/dns.hpp>
@@ -272,210 +273,11 @@ private:
     std::atomic<std::uint32_t>                          host_api_failures_{0};
 };
 
-// ── ComposerSession ──────────────────────────────────────────────────────
-//
-// L2 composer session: drives OpenSSL through a BIO_pair so the
-// encrypted byte stream travels over `gn.link.tcp` (or, later,
-// `gn.link.udp` for DTLS) via the LinkCarrier abstraction. No
-// asio::ssl::stream, no own socket — the carrier owns the raw I/O.
-//
-// Threading: every SSL/BIO op runs under `mu_`. The carrier's
-// on_data callback fires on the producer's strand (one thread per
-// L1 conn at a time per the composer contract), so contention is
-// minimal in practice; the lock exists to serialise the rare race
-// between an inbound data delivery and an outbound `do_send`
-// arriving on a different caller thread.
-class TlsLink::ComposerSession
-    : public std::enable_shared_from_this<ComposerSession> {
-public:
-    enum class Mode { Server, Client };
-
-    ComposerSession(SSL_CTX* ctx,
-                    Mode mode,
-                    gn_conn_id_t l1_id,
-                    gn_conn_id_t composer_id,
-                    std::weak_ptr<TlsLink> transport)
-        : mode_(mode),
-          l1_id_(l1_id),
-          composer_id_(composer_id),
-          transport_(std::move(transport)) {
-        ssl_ = SSL_new(ctx);
-        BIO_new_bio_pair(&internal_bio_, 0, &network_bio_, 0);
-        SSL_set_bio(ssl_, internal_bio_, internal_bio_);
-        if (mode_ == Mode::Server) SSL_set_accept_state(ssl_);
-        else                       SSL_set_connect_state(ssl_);
-    }
-
-    ComposerSession(const ComposerSession&)            = delete;
-    ComposerSession& operator=(const ComposerSession&) = delete;
-
-    ~ComposerSession() {
-        if (ssl_) {
-            SSL_free(ssl_);  // also frees internal_bio_
-            ssl_ = nullptr;
-        }
-        if (network_bio_) {
-            BIO_free(network_bio_);
-            network_bio_ = nullptr;
-        }
-    }
-
-    [[nodiscard]] gn_conn_id_t l1_id() const noexcept       { return l1_id_; }
-    [[nodiscard]] gn_conn_id_t composer_id() const noexcept { return composer_id_; }
-
-    /// Client-side kickoff. Generates the ClientHello and drains it
-    /// out to the carrier. Server-side waits for inbound bytes.
-    void kick_client_handshake(std::string peer_uri) {
-        std::lock_guard lk(mu_);
-        peer_uri_ = std::move(peer_uri);
-        (void)SSL_do_handshake(ssl_);
-        drain_to_carrier_unlocked();
-    }
-
-    /// Inbound encrypted bytes from the carrier. Drives the SSL
-    /// state machine forward; emits decrypted bytes to data
-    /// subscribers and fires accept-bus on handshake completion.
-    void feed_inbound(std::span<const std::uint8_t> bytes,
-                       std::string peer_uri) {
-        std::lock_guard lk(mu_);
-        if (peer_uri_.empty() && !peer_uri.empty()) peer_uri_ = peer_uri;
-        // Funnel inbound encrypted into network_bio.
-        if (!bytes.empty()) {
-            BIO_write(network_bio_, bytes.data(),
-                       static_cast<int>(bytes.size()));
-        }
-        // Pump the state machine: handshake first, then data reads.
-        pump_unlocked();
-    }
-
-    /// Application-level send: SSL_write → drain encrypted bytes
-    /// out of network_bio → carrier.send. Plaintext is queued when
-    /// the handshake has not completed yet.
-    gn_result_t do_send(std::span<const std::uint8_t> plain) {
-        std::lock_guard lk(mu_);
-        if (!handshake_done_) {
-            pending_writes_.emplace_back(plain.begin(), plain.end());
-            return GN_OK;
-        }
-        const int n = SSL_write(ssl_, plain.data(),
-                                  static_cast<int>(plain.size()));
-        if (n <= 0) {
-            const int err = SSL_get_error(ssl_, n);
-            if (err != SSL_ERROR_WANT_READ && err != SSL_ERROR_WANT_WRITE) {
-                closed_ = true;
-                return GN_ERR_NULL_ARG;
-            }
-        }
-        drain_to_carrier_unlocked();
-        return GN_OK;
-    }
-
-    void do_close() {
-        std::lock_guard lk(mu_);
-        if (closed_) return;
-        closed_ = true;
-        (void)SSL_shutdown(ssl_);
-        drain_to_carrier_unlocked();
-        auto t = transport_.lock();
-        if (t && t->carrier_) {
-            (void)t->carrier_->disconnect(l1_id_);
-        }
-    }
-
-private:
-    /// Run the SSL state machine: complete handshake if pending,
-    /// then read every plaintext chunk available, fire data cb for
-    /// each, then drain encrypted bytes outward.
-    void pump_unlocked() {
-        if (!handshake_done_) {
-            const int r = SSL_do_handshake(ssl_);
-            if (r == 1) {
-                handshake_done_ = true;
-                drain_to_carrier_unlocked();
-                auto t = transport_.lock();
-                if (t) {
-                    t->composer_handshake_complete(composer_id_, peer_uri_);
-                }
-                // Flush queued plaintext writes.
-                for (auto& buf : pending_writes_) {
-                    (void)SSL_write(ssl_, buf.data(),
-                                     static_cast<int>(buf.size()));
-                }
-                pending_writes_.clear();
-                drain_to_carrier_unlocked();
-            } else {
-                const int err = SSL_get_error(ssl_, r);
-                drain_to_carrier_unlocked();
-                if (err != SSL_ERROR_WANT_READ &&
-                    err != SSL_ERROR_WANT_WRITE) {
-                    closed_ = true;
-                }
-                return;
-            }
-        }
-        // Drain plaintext from SSL_read.
-        std::uint8_t buf[16 * 1024];
-        while (true) {
-            const int n = SSL_read(ssl_, buf, sizeof(buf));
-            if (n > 0) {
-                deliver_plain(buf, static_cast<std::size_t>(n));
-                continue;
-            }
-            const int err = SSL_get_error(ssl_, n);
-            if (err == SSL_ERROR_WANT_READ) break;
-            if (err == SSL_ERROR_ZERO_RETURN) {
-                closed_ = true;
-                break;
-            }
-            closed_ = true;
-            break;
-        }
-        drain_to_carrier_unlocked();
-    }
-
-    void drain_to_carrier_unlocked() {
-        auto t = transport_.lock();
-        if (!t || !t->carrier_) return;
-        std::uint8_t out[16 * 1024];
-        while (BIO_pending(network_bio_) > 0) {
-            const int n = BIO_read(network_bio_, out, sizeof(out));
-            if (n <= 0) break;
-            (void)t->carrier_->send(
-                l1_id_,
-                std::span<const std::uint8_t>(out, static_cast<std::size_t>(n)));
-        }
-    }
-
-    void deliver_plain(const std::uint8_t* bytes, std::size_t n) {
-        auto t = transport_.lock();
-        if (!t) return;
-        TlsLink::ComposerDataSub sub{};
-        {
-            std::lock_guard sub_lk(t->composer_mu_);
-            auto it = t->composer_data_subs_.find(composer_id_);
-            if (it != t->composer_data_subs_.end()) sub = it->second;
-        }
-        if (sub.cb) sub.cb(sub.user_data, composer_id_, bytes, n);
-        t->bytes_in_.fetch_add(n, std::memory_order_relaxed);
-        t->frames_in_.fetch_add(1, std::memory_order_relaxed);
-    }
-
-    Mode                                   mode_;
-    gn_conn_id_t                           l1_id_;
-    gn_conn_id_t                           composer_id_;
-    std::weak_ptr<TlsLink>                 transport_;
-
-    std::mutex                             mu_;
-    SSL*                                   ssl_           = nullptr;
-    BIO*                                   internal_bio_  = nullptr;
-    BIO*                                   network_bio_   = nullptr;
-    bool                                   handshake_done_ = false;
-    bool                                   closed_         = false;
-    std::string                            peer_uri_;
-    std::deque<std::vector<std::uint8_t>>  pending_writes_;
-};
-
 // ── TlsLink ──────────────────────────────────────────────────────────────
+// `class TlsLink::ComposerSession` definition lives out-of-line so
+// the BIO pump can grow without bloating this TU; declaration in
+// `tls.hpp` (forward) and the body in `tls_composer_session.{hpp,cpp}`
+// — included above.
 
 TlsLink::TlsLink()
     : ioc_(),
@@ -667,28 +469,18 @@ std::string TlsLink::endpoint_to_uri(
     return s.str();
 }
 
-bool TlsLink::load_server_credentials() {
+bool TlsLink::load_server_credentials_into(asio::ssl::context& ctx) {
     /// Test-fixture override wins so unit tests stay independent
     /// of the kernel config. Production paths flow through
     /// `host_api->config_get` with `GN_CONFIG_VALUE_STRING`.
     if (!override_cert_pem_.empty() && !override_key_pem_.empty()) {
         try {
-            server_ctx_.use_certificate_chain(
+            ctx.use_certificate_chain(
                 asio::buffer(override_cert_pem_));
-            server_ctx_.use_private_key(
+            ctx.use_private_key(
                 asio::buffer(override_key_pem_.data(),
                               override_key_pem_.size()),
                 asio::ssl::context::pem);
-            /// Per plugins/security/noise/docs/handshake.md §5b: OpenSSL has copied the
-            /// key bytes into its own context; the override buffer
-            /// has no remaining purpose. Wipe it eagerly so the
-            /// secret does not outlive its purpose. The buffer
-            /// stays allocated (empty()) so a follow-up
-            /// `set_server_credentials` reassign hits the same
-            /// storage path.
-            sodium_memzero(override_key_pem_.data(),
-                            override_key_pem_.size());
-            override_key_pem_.clear();
             return true;
         } catch (...) {
             return false;
@@ -717,8 +509,8 @@ bool TlsLink::load_server_credentials() {
     }
     bool ok = false;
     try {
-        server_ctx_.use_certificate_chain_file(cert_path);
-        server_ctx_.use_private_key_file(key_path,
+        ctx.use_certificate_chain_file(cert_path);
+        ctx.use_private_key_file(key_path,
             asio::ssl::context::pem);
         ok = true;
     } catch (...) {
@@ -727,6 +519,23 @@ bool TlsLink::load_server_credentials() {
     if (cert_free) cert_free(cert_user_data, cert_path);
     if (key_free)  key_free(key_user_data, key_path);
     return ok;
+}
+
+bool TlsLink::load_server_credentials() {
+    /// TLS-side credential load. Honours the eager-wipe contract per
+    /// `plugins/security/noise/docs/handshake.md` §5b: once OpenSSL
+    /// has copied the override key into the context, wipe the
+    /// override buffer so the secret does not linger in process
+    /// memory. Callers that also need DTLS credentials must re-set
+    /// the override through `set_server_credentials` before the
+    /// dtls:// path triggers `load_server_credentials_into`.
+    if (!load_server_credentials_into(server_ctx_)) return false;
+    if (!override_key_pem_.empty()) {
+        sodium_memzero(override_key_pem_.data(),
+                        override_key_pem_.size());
+        override_key_pem_.clear();
+    }
+    return true;
 }
 
 gn_result_t TlsLink::listen(std::string_view uri) {
@@ -1045,7 +854,41 @@ gn_result_t TlsLink::disconnect(gn_conn_id_t conn) {
 
 // ── Composer L2 surface ─────────────────────────────────────────────────
 
+gn_result_t TlsLink::composer_listen_port(
+    std::uint16_t* out_port) const noexcept {
+    if (!out_port) return GN_ERR_NULL_ARG;
+    *out_port = 0;
+    /// Prefer the TLS carrier port when both are bound (legacy
+    /// single-scheme deployments); DTLS-only deployments fall through
+    /// to the UDP carrier. The two never collide because a TlsLink
+    /// instance that serves both protocols binds two independent
+    /// ephemeral ports — callers that need to distinguish should
+    /// query the right carrier explicitly through the SDK helper.
+    if (carrier_) {
+        const auto port = carrier_->listen_port();
+        if (port != 0) { *out_port = port; return GN_OK; }
+    }
+    if (carrier_dtls_) {
+        const auto port = carrier_dtls_->listen_port();
+        if (port != 0) { *out_port = port; return GN_OK; }
+    }
+    return GN_ERR_INVALID_STATE;
+}
+
 gn_result_t TlsLink::ensure_carrier(std::string_view scheme) {
+    /// DTLS rides the `udp` carrier; TLS rides `tcp`. The two are
+    /// independent optional handles so a single TlsLink instance can
+    /// concurrently serve `tls://` and `dtls://` sessions without
+    /// rebinding either carrier.
+    if (scheme == "udp") {
+        if (carrier_dtls_) return GN_OK;
+        if (!api_) return GN_ERR_INVALID_STATE;
+        auto opt = gn::sdk::LinkCarrier::query(api_, "udp");
+        if (!opt) return GN_ERR_NOT_FOUND;
+        carrier_dtls_.emplace(std::move(*opt));
+        return GN_OK;
+    }
+
     if (carrier_) {
         if (!carrier_scheme_.empty() && carrier_scheme_ != scheme) {
             return GN_ERR_INVALID_STATE;
@@ -1060,28 +903,124 @@ gn_result_t TlsLink::ensure_carrier(std::string_view scheme) {
     return GN_OK;
 }
 
+namespace {
+
+void apply_protocol_options(asio::ssl::context& ctx, bool dtls) noexcept {
+    /// Family-aware option mask: TLS contexts disable every pre-1.3
+    /// version explicitly. DTLS contexts only have DTLS 1.0 / 1.2 /
+    /// (1.3 in OpenSSL 3.2+) to choose from — the no_tlsv* flags are
+    /// no-ops on DTLS contexts and the no_compression flag is still
+    /// meaningful (CRIME class mitigations still apply).
+    auto opts = asio::ssl::context::default_workarounds |
+                asio::ssl::context::no_sslv2 |
+                asio::ssl::context::no_sslv3 |
+                asio::ssl::context::no_compression;
+    if (!dtls) {
+        opts |= asio::ssl::context::no_tlsv1 |
+                asio::ssl::context::no_tlsv1_1 |
+                asio::ssl::context::no_tlsv1_2;
+    }
+    ctx.set_options(opts);
+}
+
+}  // namespace
+
+gn_result_t TlsLink::ensure_dtls_contexts() {
+    /// Lazy init: zero allocation cost for TLS-only deployments,
+    /// constructed on the first dtls:// composer call. asio 1.36
+    /// does not expose a `dtls_*` enum on `context::method`; we
+    /// construct the OpenSSL `SSL_CTX*` directly via `DTLS_method()`
+    /// and hand it to asio's native-handle constructor, which takes
+    /// ownership and free's it through `SSL_CTX_free` in the
+    /// context dtor.
+    if (!server_ctx_dtls_) {
+        SSL_CTX* raw = SSL_CTX_new(DTLS_method());
+        if (!raw) return GN_ERR_NULL_ARG;
+        try {
+            server_ctx_dtls_.emplace(raw);  // takes ownership
+            apply_protocol_options(*server_ctx_dtls_, /*dtls=*/true);
+        } catch (...) {
+            /// asio's ctor `free`s the handle on throw; emplace
+            /// failure leaves the optional empty.
+            server_ctx_dtls_.reset();
+            return GN_ERR_NULL_ARG;
+        }
+    }
+    if (!client_ctx_dtls_) {
+        SSL_CTX* raw = SSL_CTX_new(DTLS_method());
+        if (!raw) return GN_ERR_NULL_ARG;
+        try {
+            client_ctx_dtls_.emplace(raw);  // takes ownership
+            apply_protocol_options(*client_ctx_dtls_, /*dtls=*/true);
+            /// Mirror the verify-mode of the TLS client side so a
+            /// deployment that flipped `links.tls.verify_peer` to
+            /// false picks up the same opt-out for DTLS without a
+            /// second config key. asio 1.36 has `set_verify_mode`
+            /// but no `get_verify_mode`; read directly from the
+            /// OpenSSL handle.
+            const int vm = SSL_CTX_get_verify_mode(
+                client_ctx_.native_handle());
+            asio::ssl::verify_mode vmask =
+                static_cast<asio::ssl::verify_mode>(vm);
+            client_ctx_dtls_->set_verify_mode(vmask);
+            try {
+                client_ctx_dtls_->set_default_verify_paths();
+            } catch (...) {
+                /// Mirror the TLS-side behaviour: load failure is
+                /// logged but does not block context construction —
+                /// peers may opt out of verify_peer through config.
+            }
+        } catch (...) {
+            client_ctx_dtls_.reset();
+            return GN_ERR_NULL_ARG;
+        }
+    }
+    return GN_OK;
+}
+
 gn_result_t TlsLink::composer_listen(std::string_view uri) {
     if (shutdown_.load(std::memory_order_acquire)) {
         return GN_ERR_INVALID_STATE;
     }
-    // For TLS-on-TCP: carrier scheme is "tcp", carrier URI substitutes
-    // the scheme prefix. DTLS-on-UDP polarises this to "udp" later.
-    if (!uri.starts_with("tls://")) return GN_ERR_INVALID_ENVELOPE;
-    if (const auto rc = ensure_carrier("tcp"); rc != GN_OK) return rc;
-    if (!load_server_credentials()) return GN_ERR_NULL_ARG;
+    const bool dtls = uri.starts_with("dtls://");
+    const bool tls  = uri.starts_with("tls://");
+    if (!tls && !dtls) return GN_ERR_INVALID_ENVELOPE;
+
+    const std::string_view scheme       = dtls ? "udp" : "tcp";
+    const std::size_t      prefix_len   = dtls ? 7 : 6;
+    const std::string      l1_prefix    = dtls ? "udp://" : "tcp://";
+
+    if (const auto rc = ensure_carrier(scheme); rc != GN_OK) return rc;
+    if (dtls) {
+        if (const auto rc = ensure_dtls_contexts(); rc != GN_OK) return rc;
+        if (!load_server_credentials_into(*server_ctx_dtls_)) {
+            return GN_ERR_NULL_ARG;
+        }
+        if (!override_key_pem_.empty()) {
+            sodium_memzero(override_key_pem_.data(),
+                            override_key_pem_.size());
+            override_key_pem_.clear();
+        }
+    } else {
+        if (!load_server_credentials()) return GN_ERR_NULL_ARG;
+    }
 
     const std::string l1_uri =
-        std::string("tcp://") + std::string(uri.substr(6));
+        l1_prefix + std::string(uri.substr(prefix_len));
 
+    auto& carrier = dtls ? *carrier_dtls_ : *carrier_;
     auto self_weak = weak_from_this();
-    const auto rc = carrier_->on_accept(
-        [self_weak](gn_conn_id_t l1, std::string_view peer_uri) {
+    /// Capture by-value so the accept callback dispatches against
+    /// the right family even if a later composer_listen flips the
+    /// active carrier scheme.
+    const auto rc = carrier.on_accept(
+        [self_weak, dtls](gn_conn_id_t l1, std::string_view peer_uri) {
             if (auto t = self_weak.lock()) {
-                t->composer_on_l1_accept(l1, peer_uri);
+                t->composer_on_l1_accept(l1, peer_uri, dtls);
             }
         });
     if (rc != GN_OK) return rc;
-    return carrier_->listen(l1_uri);
+    return carrier.listen(l1_uri);
 }
 
 gn_result_t TlsLink::composer_connect(std::string_view uri,
@@ -1091,28 +1030,45 @@ gn_result_t TlsLink::composer_connect(std::string_view uri,
     if (shutdown_.load(std::memory_order_acquire)) {
         return GN_ERR_INVALID_STATE;
     }
-    if (!uri.starts_with("tls://")) return GN_ERR_INVALID_ENVELOPE;
-    if (const auto rc = ensure_carrier("tcp"); rc != GN_OK) return rc;
+    const bool dtls = uri.starts_with("dtls://");
+    const bool tls  = uri.starts_with("tls://");
+    if (!tls && !dtls) return GN_ERR_INVALID_ENVELOPE;
+
+    const std::string_view scheme     = dtls ? "udp" : "tcp";
+    const std::size_t      prefix_len = dtls ? 7 : 6;
+    const std::string      l1_prefix  = dtls ? "udp://" : "tcp://";
+
+    if (const auto rc = ensure_carrier(scheme); rc != GN_OK) return rc;
+    if (dtls) {
+        if (const auto rc = ensure_dtls_contexts(); rc != GN_OK) return rc;
+    }
+
     const std::string l1_uri =
-        std::string("tcp://") + std::string(uri.substr(6));
+        l1_prefix + std::string(uri.substr(prefix_len));
+
+    auto& carrier = dtls ? *carrier_dtls_ : *carrier_;
 
     gn_conn_id_t l1 = GN_INVALID_ID;
-    const auto rc = carrier_->connect(l1_uri, &l1);
+    const auto rc = carrier.connect(l1_uri, &l1);
     if (rc != GN_OK) return rc;
+
+    SSL_CTX* ctx = dtls ? client_ctx_dtls_->native_handle()
+                        : client_ctx_.native_handle();
 
     const gn_conn_id_t composer_id =
         next_composer_id_.fetch_add(1, std::memory_order_relaxed) |
         kComposerIdBit;
     auto cs = std::make_shared<ComposerSession>(
-        client_ctx_.native_handle(), ComposerSession::Mode::Client,
-        l1, composer_id, weak_from_this());
+        ctx, ComposerSession::Mode::Client,
+        l1, composer_id, weak_from_this(), dtls);
     {
         std::lock_guard lk(composer_mu_);
         composer_sessions_[composer_id] = cs;
         l1_to_composer_[l1] = composer_id;
+        composer_is_dtls_[composer_id] = dtls;
     }
     auto self_weak = weak_from_this();
-    (void)carrier_->on_data(
+    (void)carrier.on_data(
         l1,
         [self_weak](gn_conn_id_t lid,
                     std::span<const std::uint8_t> bytes) {
@@ -1170,21 +1126,27 @@ gn_result_t TlsLink::composer_unsubscribe_accept(
 }
 
 void TlsLink::composer_on_l1_accept(gn_conn_id_t l1,
-                                     std::string_view peer_uri) {
+                                     std::string_view peer_uri,
+                                     bool             dtls) {
+    SSL_CTX* ctx = dtls ? server_ctx_dtls_->native_handle()
+                        : server_ctx_.native_handle();
     const gn_conn_id_t composer_id =
         next_composer_id_.fetch_add(1, std::memory_order_relaxed) |
         kComposerIdBit;
     auto cs = std::make_shared<ComposerSession>(
-        server_ctx_.native_handle(), ComposerSession::Mode::Server,
-        l1, composer_id, weak_from_this());
+        ctx, ComposerSession::Mode::Server,
+        l1, composer_id, weak_from_this(), dtls);
     {
         std::lock_guard lk(composer_mu_);
         composer_sessions_[composer_id] = cs;
         l1_to_composer_[l1] = composer_id;
+        composer_is_dtls_[composer_id] = dtls;
     }
     auto self_weak = weak_from_this();
-    if (carrier_) {
-        (void)carrier_->on_data(
+    auto* carrier_ptr = dtls ? (carrier_dtls_ ? &*carrier_dtls_ : nullptr)
+                              : (carrier_     ? &*carrier_     : nullptr);
+    if (carrier_ptr) {
+        (void)carrier_ptr->on_data(
             l1,
             [self_weak](gn_conn_id_t lid,
                         std::span<const std::uint8_t> bytes) {
@@ -1235,6 +1197,7 @@ void TlsLink::composer_drop_session(gn_conn_id_t composer_id) {
         l1_to_composer_.erase(cs->l1_id());
         composer_sessions_.erase(it);
         composer_data_subs_.erase(composer_id);
+        composer_is_dtls_.erase(composer_id);
     }
 }
 
@@ -1322,8 +1285,8 @@ void TlsLink::shutdown() {
         acceptor_.reset();
     }
 
-    // Composer-mode teardown: drop the LinkCarrier (its dtor
-    // unsubscribes accept-bus + per-conn data subs), close every
+    // Composer-mode teardown: drop both LinkCarriers (their dtors
+    // unsubscribe accept-bus + per-conn data subs), close every
     // composer session.
     {
         std::vector<std::shared_ptr<ComposerSession>> composer_drain;
@@ -1335,11 +1298,13 @@ void TlsLink::shutdown() {
             }
             composer_sessions_.clear();
             l1_to_composer_.clear();
+            composer_is_dtls_.clear();
             composer_data_subs_.clear();
             composer_accept_subs_.clear();
         }
         for (auto& cs : composer_drain) cs->do_close();
         carrier_.reset();
+        carrier_dtls_.reset();
     }
 
     if (api_ && api_->notify_disconnect) {

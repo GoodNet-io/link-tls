@@ -98,6 +98,14 @@ public:
     [[nodiscard]] gn_result_t composer_unsubscribe_accept(
         gn_subscription_id_t token);
 
+    /// Bound L1 port of the carrier acceptor that backs the active
+    /// composer-listen, propagated up so a tls:// composer caller can
+    /// surface an ephemeral port that the underlying `gn.link.tcp`
+    /// picked. Returns @ref GN_ERR_INVALID_STATE when the carrier is
+    /// not bound or the L1 listen has not been issued yet.
+    [[nodiscard]] gn_result_t composer_listen_port(
+        std::uint16_t* out_port) const noexcept;
+
     static constexpr gn_conn_id_t kComposerIdBit =
         gn_conn_id_t{1} << 63;
 
@@ -168,6 +176,13 @@ private:
     std::vector<std::thread>                                         workers_;
     asio::ssl::context                                               server_ctx_;
     asio::ssl::context                                               client_ctx_;
+    /// DTLS contexts mirror their TLS siblings. OpenSSL's DTLS state
+    /// machine lives entirely inside `SSL*`; the BIO_pair pump from
+    /// the composer path drives both protocol families identically.
+    /// Initialised lazily on first dtls:// composer call so plain-TLS
+    /// deployments do not pay the cost of an unused DTLS context.
+    std::optional<asio::ssl::context>                                server_ctx_dtls_;
+    std::optional<asio::ssl::context>                                client_ctx_dtls_;
 
     std::optional<asio::ip::tcp::acceptor>                           acceptor_;
     std::atomic<std::uint16_t>                                       listen_port_{0};
@@ -207,31 +222,53 @@ private:
     const host_api_t* api_ = nullptr;
 
     /// Composer-mode state. TlsLink layers TLS over a lower-layer
-    /// carrier (gn.link.tcp today; gn.link.udp for DTLS later).
+    /// carrier. A single instance can serve both `tls://` (over
+    /// gn.link.tcp) and `dtls://` (over gn.link.udp) — the two
+    /// carriers are independent optional handles initialised on demand.
     /// Composer-owned sessions live in a separate map from kernel-
     /// managed Sessions; composer conn ids carry `kComposerIdBit`.
-    /// `carrier_` is bound lazily on the first composer_listen /
-    /// composer_connect, then reused across sessions.
-    std::optional<gn::sdk::LinkCarrier>                              carrier_;
+    std::optional<gn::sdk::LinkCarrier>                              carrier_;       /// "tcp" — TLS
+    std::optional<gn::sdk::LinkCarrier>                              carrier_dtls_;  /// "udp" — DTLS
     mutable std::mutex                                               composer_mu_;
     std::unordered_map<gn_conn_id_t,
                        std::shared_ptr<ComposerSession>>             composer_sessions_;
     /// Map from L1 (carrier) conn id → composer conn id, so the
     /// carrier's on_data callback can find the matching session.
+    /// L1 ids from the two carriers (tcp / udp) share a single
+    /// namespace at this map level because `gn_conn_id_t` is
+    /// globally unique within a process and the issuing plugin's
+    /// `next_composer_id_` counters do not collide.
     std::unordered_map<gn_conn_id_t, gn_conn_id_t>                   l1_to_composer_;
+    /// Per composer-id flag: this session rides the DTLS carrier
+    /// rather than TCP. Used by `do_close` and `do_send` so the
+    /// session can `disconnect`/`send` through the right carrier
+    /// without holding a pointer to it.
+    std::unordered_map<gn_conn_id_t, bool>                           composer_is_dtls_;
     std::unordered_map<gn_conn_id_t, ComposerDataSub>                composer_data_subs_;
     std::vector<ComposerAcceptSub>                                   composer_accept_subs_;
     std::atomic<std::uint64_t>                                       next_composer_id_{1};
     std::atomic<std::uint64_t>                                       next_accept_token_{1};
-    /// `gn.link.<scheme>` carrier name once polarized — "tcp" for
-    /// tls://, "udp" for dtls:// (future DTLS slice).
+    /// Bound name of the active TLS carrier ("tcp"). DTLS carrier
+    /// is always "udp" so it doesn't need a separate slot.
     std::string                                                      carrier_scheme_;
 
     [[nodiscard]] gn_result_t ensure_carrier(std::string_view scheme);
+    /// Lazy-init DTLS server + client contexts on first dtls:// call.
+    /// Idempotent; safe to call from both composer_listen and
+    /// composer_connect.
+    [[nodiscard]] gn_result_t ensure_dtls_contexts();
+    /// Load server certificate + key into the given context. Honours
+    /// the test-fixture override and falls back to kernel config
+    /// `links.tls.cert_path` / `links.tls.key_path`. Centralised so
+    /// the TLS server and DTLS server contexts share one credential
+    /// pipeline.
+    [[nodiscard]] bool load_server_credentials_into(
+        asio::ssl::context& ctx);
     void composer_on_l1_data(gn_conn_id_t l1,
                               std::span<const std::uint8_t> bytes);
     void composer_on_l1_accept(gn_conn_id_t l1,
-                                std::string_view peer_uri);
+                                std::string_view peer_uri,
+                                bool             dtls = false);
     void composer_handshake_complete(gn_conn_id_t composer_id,
                                       std::string_view peer_uri);
     void composer_drop_session(gn_conn_id_t composer_id);
