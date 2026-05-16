@@ -5,6 +5,11 @@
 #include "tls.hpp"
 #include "tls_composer_session.hpp"
 
+#include <chrono>
+#include <optional>
+
+#include <asio/steady_timer.hpp>
+
 #include <sdk/convenience.h>
 #include <sdk/cpp/dns.hpp>
 #include <sdk/cpp/uri.hpp>
@@ -72,6 +77,39 @@ public:
                 }));
     }
 
+    /// Strand-bound retry for the parked `stalled_inbound_` bytes.
+    /// Identical shape to `tcp.cpp:146-181`; the OpenSSL stream
+    /// reuses the same kernel-session backpressure contract.
+    void retry_stalled_inbound() {
+        if (!retry_timer_) {
+            retry_timer_.emplace(strand_);
+        }
+        retry_timer_->expires_after(std::chrono::microseconds(100));
+        retry_timer_->async_wait(asio::bind_executor(strand_,
+            [self = shared_from_this()](const std::error_code& ec) {
+                if (ec) return;
+                auto t = self->transport_.lock();
+                if (!t || !t->api_ || !t->api_->notify_inbound_bytes) return;
+                if (self->stalled_inbound_.empty()) {
+                    self->start_read();
+                    return;
+                }
+                const gn_result_t rc =
+                    t->api_->notify_inbound_bytes(
+                        t->api_->host_ctx, self->conn_id,
+                        self->stalled_inbound_.data(),
+                        self->stalled_inbound_.size());
+                if (rc == GN_ERR_LIMIT_REACHED) {
+                    self->retry_stalled_inbound();
+                    return;
+                }
+                self->stalled_inbound_.clear();
+                self->host_api_failures_.store(
+                    0, std::memory_order_relaxed);
+                self->start_read();
+            }));
+    }
+
     void start_read() {
         ssl_.async_read_some(
             asio::buffer(read_buf_),
@@ -103,14 +141,20 @@ public:
                             } else if (rc == GN_ERR_LIMIT_REACHED) {
                                 /// Receiver-side backpressure — match
                                 /// the TCP sibling
-                                /// (`plugins/links/tcp/tcp.cpp:96-118`)
-                                /// and treat the rejection as transient
-                                /// rather than counting toward the
-                                /// 16-failure disconnect. Full parked-
-                                /// bytes + strand retry lands as the
-                                /// follow-up that completes B-LINKS-06.
+                                /// (`plugins/links/tcp/tcp.cpp:96-181`).
+                                /// Park the rejected chunk and schedule
+                                /// a strand-bound retry; the read loop
+                                /// pauses until drained so the next
+                                /// chunk does not race ahead of the
+                                /// AEAD nonce sequencing the kernel
+                                /// session holds.
                                 self->host_api_failures_.store(
                                     0, std::memory_order_relaxed);
+                                self->stalled_inbound_.assign(
+                                    self->read_buf_.data(),
+                                    self->read_buf_.data() + n);
+                                self->retry_stalled_inbound();
+                                return;  /// don't re-arm read
                             } else {
                                 const auto fails =
                                     self->host_api_failures_.fetch_add(
@@ -282,6 +326,12 @@ private:
     /// 16 in a row disconnects the conn so a peer that floods
     /// the security layer with garbage cannot keep it alive.
     std::atomic<std::uint32_t>                          host_api_failures_{0};
+    /// Bytes parked when `notify_inbound_bytes` returned
+    /// `LIMIT_REACHED`. Mirrors the TCP / IPC pattern — the read
+    /// loop pauses until the retry timer drains them so AEAD
+    /// nonce sequencing across the session stays consistent.
+    std::vector<std::uint8_t>                           stalled_inbound_;
+    std::optional<asio::steady_timer>                   retry_timer_;
 };
 
 // ── TlsLink ──────────────────────────────────────────────────────────────
