@@ -100,6 +100,17 @@ public:
                             if (rc == GN_OK) {
                                 self->host_api_failures_.store(
                                     0, std::memory_order_relaxed);
+                            } else if (rc == GN_ERR_LIMIT_REACHED) {
+                                /// Receiver-side backpressure — match
+                                /// the TCP sibling
+                                /// (`plugins/links/tcp/tcp.cpp:96-118`)
+                                /// and treat the rejection as transient
+                                /// rather than counting toward the
+                                /// 16-failure disconnect. Full parked-
+                                /// bytes + strand retry lands as the
+                                /// follow-up that completes B-LINKS-06.
+                                self->host_api_failures_.store(
+                                    0, std::memory_order_relaxed);
                             } else {
                                 const auto fails =
                                     self->host_api_failures_.fetch_add(
