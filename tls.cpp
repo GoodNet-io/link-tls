@@ -576,13 +576,23 @@ gn_result_t TlsLink::listen(std::string_view uri) {
                          v6_ec.message().c_str());
         }
     }
+    /// `reuse_address` is best-effort like in the TCP sibling — a
+    /// platform that refuses the option still gets a working
+    /// listener, just one that may EADDRINUSE on a quick restart.
+    /// The previous `LIMIT_REACHED` return turned a portability
+    /// nuance into a hard error.
     if (acc.set_option(asio::ip::tcp::acceptor::reuse_address(true), ec)) {
-        return GN_ERR_LIMIT_REACHED;
+        if (api_) {
+            gn_log_debug(api_, "tls: reuse_address(true) failed: %s",
+                         ec.message().c_str());
+        }
     }
-    if (acc.bind(ep, ec)) return GN_ERR_LIMIT_REACHED;
-    if (acc.listen(asio::socket_base::max_listen_connections, ec)) {
-        return GN_ERR_LIMIT_REACHED;
-    }
+    /// bind / listen — system errors mirror the TCP sibling's
+    /// `GN_ERR_NULL_ARG` so a kernel that calls every link plugin
+    /// in turn sees the same code for "asio refused the syscall"
+    /// regardless of which transport it tried.
+    if (acc.bind(ep, ec))                                           return GN_ERR_NULL_ARG;
+    if (acc.listen(asio::socket_base::max_listen_connections, ec))  return GN_ERR_NULL_ARG;
     listen_port_.store(acc.local_endpoint().port(),
                         std::memory_order_release);
     acceptor_.emplace(std::move(acc));
