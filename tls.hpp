@@ -176,6 +176,14 @@ private:
     std::vector<std::thread>                                         workers_;
     asio::ssl::context                                               server_ctx_;
     asio::ssl::context                                               client_ctx_;
+    /// Set true when `set_default_verify_paths()` succeeded for the
+    /// client context during `set_host_api`. False after a load
+    /// failure — `connect()` refuses outbound TLS in that state
+    /// unless the operator explicitly turned verify-peer off through
+    /// `links.tls.verify_peer = false`. Default true so an instance
+    /// built without `set_host_api` (test harnesses that drive
+    /// `set_verify_peer(false)` directly) keeps working.
+    bool                                                              trust_store_loaded_{true};
     /// DTLS contexts mirror their TLS siblings. OpenSSL's DTLS state
     /// machine lives entirely inside `SSL*`; the BIO_pair pump from
     /// the composer path drives both protocol families identically.

@@ -356,28 +356,27 @@ void TlsLink::set_host_api(const host_api_t* api) noexcept {
     /// none deployment to one without the config key would leave
     /// the previous opt-out in force.
     set_verify_peer(true);
-    bool trust_store_loaded = true;
+    trust_store_loaded_ = true;
     try {
         client_ctx_.set_default_verify_paths();
     } catch (const std::exception& e) {
-        trust_store_loaded = false;
+        trust_store_loaded_ = false;
         if (api_ != nullptr) {
             gn_log_warn(api_,
                 "tls: default trust store load failed: %s; "
-                "verify_peer handshakes will fail until "
+                "connect() will refuse outbound TLS until "
                 "links.tls.verify_peer is set false or a "
                 "trust bundle is loaded explicitly", e.what());
         }
     } catch (...) {
-        trust_store_loaded = false;
+        trust_store_loaded_ = false;
         if (api_ != nullptr) {
             gn_log_warn(api_,
                 "tls: default trust store load failed: unknown "
-                "exception; verify_peer handshakes will fail until "
-                "links.tls.verify_peer is set false");
+                "exception; connect() will refuse outbound TLS "
+                "until links.tls.verify_peer is set false");
         }
     }
-    (void)trust_store_loaded;
     /// Honour `links.tls.verify_peer` config opt-out. The flag
     /// defaults to true (verify peer cert against the OpenSSL trust
     /// store); explicit `false` switches to verify_none for the
@@ -660,6 +659,25 @@ void TlsLink::on_accept(std::shared_ptr<Session> session,
 
 gn_result_t TlsLink::connect(std::string_view uri) {
     if (shutdown_.load(std::memory_order_acquire)) return GN_ERR_NULL_ARG;
+
+    /// Fail-closed: if the default trust store could not be loaded
+    /// during `set_host_api` and the operator did not opt out of
+    /// peer verification through `links.tls.verify_peer = false`,
+    /// refuse the connect up front rather than queue an
+    /// `SSL_VERIFY_PEER` handshake that will fail at the OpenSSL
+    /// layer with a generic certificate-verify error.
+    if (!trust_store_loaded_) {
+        const int vm = SSL_CTX_get_verify_mode(client_ctx_.native_handle());
+        if ((vm & SSL_VERIFY_PEER) != 0) {
+            if (api_) {
+                gn_log_error(api_,
+                    "tls: refusing connect — no trust store loaded "
+                    "and verify_peer is on; set "
+                    "links.tls.verify_peer = false to override");
+            }
+            return GN_ERR_INVALID_STATE;
+        }
+    }
 
     /// Hostname → IP literal up-front per `dns.md` §1; the rest of
     /// the connect path expects a literal-host URI so the OpenSSL
