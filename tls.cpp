@@ -750,7 +750,7 @@ gn_result_t TlsLink::connect(std::string_view uri) {
         }
     }
 
-    /// Hostname → IP literal up-front per `dns.md` §1; the rest of
+    /// Hostname → IP literal up-front per `dns.en.md` §1; the rest of
     /// the connect path expects a literal-host URI so the OpenSSL
     /// certificate-name match (when enabled) sees the same identity
     /// the connection registry will key on.
@@ -1341,7 +1341,7 @@ void TlsLink::shutdown() {
         /// same lock and skips its own emit. Without the lock-
         /// bracketed publish, the worker could erase a session
         /// between shutdown's exchange and snapshot, dropping the
-        /// kernel's only release event for that conn (link.md §9
+        /// kernel's only release event for that conn (link.en.md §9
         /// step 3).
         std::lock_guard lk(sessions_mu_);
         if (!shutdown_.exchange(true, std::memory_order_acq_rel)) {

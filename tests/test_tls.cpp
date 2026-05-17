@@ -415,5 +415,5 @@ TEST(TlsLink_Shutdown, SynchronousNotifyDisconnect) {
         << "TlsLink::shutdown() must fire notify_disconnect "
            "synchronously on the caller thread for every live "
            "session before ioc_.stop() drops strand-bound "
-           "continuations (link.md §9).";
+           "continuations (link.en.md §9).";
 }
