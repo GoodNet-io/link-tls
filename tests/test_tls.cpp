@@ -30,7 +30,7 @@ struct TlsHarness {
     std::vector<gn_handshake_role_t>            roles;
     std::vector<std::vector<std::uint8_t>>      inbound;
 
-    /// Caller-thread pin for the `link.md` §9 regression. Set
+    /// Caller-thread pin for the `link.en.md` §9 regression. Set
     /// `main_tid` to `std::this_thread::get_id()` from the test
     /// before invoking `shutdown()`; `s_notify_disconnect`
     /// increments `on_main_disconnects` only when the call lands
@@ -366,7 +366,7 @@ TEST(TlsLink, LoopbackHandshakeAndPayloadRoundTrip) {
 }
 
 TEST(TlsLink_Shutdown, SynchronousNotifyDisconnect) {
-    /// `link.md` §9 — shutdown releases every kernel-observable
+    /// `link.en.md` §9 — shutdown releases every kernel-observable
     /// session before the io_context tear-down. Pre-fix, TLS closed
     /// the per-session sockets and let `ioc_.stop()` drop the read-
     /// completion path that fires `notify_disconnect`; the kernel-

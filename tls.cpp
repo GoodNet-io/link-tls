@@ -786,7 +786,7 @@ gn_result_t TlsLink::connect(std::string_view uri) {
             if (cec) {
                 /// Connect failed before any `notify_connect` —
                 /// kernel has no record to release. Operator
-                /// diagnostic only; per `link.md` §9 a connect
+                /// diagnostic only; per `link.en.md` §9 a connect
                 /// failure is not a session release event but
                 /// still must be observable.
                 if (auto t = weak.lock(); t && t->api_) {
@@ -1331,7 +1331,7 @@ void TlsLink::shutdown() {
     /// notification, kernel-side `ConnectionRegistry` keeps live
     /// records past tls shutdown, which in turn keeps the security
     /// plugin's lifetime anchor alive past the PluginManager drain
-    /// budget. Per `link.md` §9.
+    /// budget. Per `link.en.md` §9.
     bool first_call = false;
     std::vector<gn_conn_id_t> ids_to_emit;
     {

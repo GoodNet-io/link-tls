@@ -15,7 +15,7 @@
 /// certificate against OpenSSL's default trust store by default;
 /// operators who run TLS underneath Noise authentication opt out
 /// explicitly through `links.tls.verify_peer = false` on the
-/// kernel config (`security-trust.md` §3 single-source principle).
+/// kernel config (`security-trust.en.md` §3 single-source principle).
 
 #pragma once
 
@@ -214,7 +214,7 @@ private:
     std::atomic<std::uint64_t> frames_in_{0};
     std::atomic<std::uint64_t> frames_out_{0};
 
-    /// Per-connection write-queue thresholds per `backpressure.md` §1.
+    /// Per-connection write-queue thresholds per `backpressure.en.md` §1.
     std::uint64_t pending_queue_bytes_low_  = 0;
     std::uint64_t pending_queue_bytes_high_ = 0;
     std::uint64_t pending_queue_bytes_hard_ = 0;
