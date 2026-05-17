@@ -367,12 +367,12 @@ TEST(TlsLink, LoopbackHandshakeAndPayloadRoundTrip) {
 
 TEST(TlsLink_Shutdown, SynchronousNotifyDisconnect) {
     /// `link.en.md` §9 — shutdown releases every kernel-observable
-    /// session before the io_context tear-down. Pre-fix, TLS closed
-    /// the per-session sockets and let `ioc_.stop()` drop the read-
-    /// completion path that fires `notify_disconnect`; the kernel-
-    /// side `ConnectionRegistry` then kept live records past
-    /// shutdown and held the security plugin's lifetime anchor.
-    /// Carry-over of the TCP fix in commit bda18c6.
+    /// session before the io_context tear-down. Closing the
+    /// per-session sockets and relying on `ioc_.stop()` to drop
+    /// the read-completion path that fires `notify_disconnect`
+    /// would leave some sessions unsent; `ConnectionRegistry`
+    /// would then keep records live past shutdown and hold the
+    /// security plugin's lifetime anchor.
     std::string cert, key;
     ASSERT_TRUE(generate_self_signed(cert, key));
 
