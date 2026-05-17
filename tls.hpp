@@ -206,7 +206,7 @@ private:
     /// worker callback already raced ahead of shutdown and erased
     /// the live entry. The double-emit is benign: the kernel
     /// resolves the second call through `GN_ERR_NOT_FOUND` per
-    /// `host_api_builder.cpp` thunk_notify_disconnect §1604.
+    /// `core/kernel/host_api/notifications.cpp::notify_disconnect`.
     std::vector<gn_conn_id_t>                                           published_ids_;
 
     std::atomic<std::uint64_t> bytes_in_{0};

@@ -136,7 +136,8 @@ TEST(TlsLink_VerifyDefault, ClientRejectsUntrustedCertWithoutOptOut) {
     client->set_host_api(&api);
     server->set_server_credentials(cert, key);
     /// Note: no `client->set_verify_peer(false)` — default verify
-    /// stays on; this is the regression scenario.
+    /// stays on so the handshake fails against an untrusted cert,
+    /// which is the case under test.
 
     ASSERT_EQ(server->listen("tls://127.0.0.1:0"), GN_OK);
     const auto port = server->listen_port();
