@@ -151,7 +151,7 @@ TEST(TlsLink_VerifyDefault, ClientRejectsUntrustedCertWithoutOptOut) {
     /// Wait for any handshake completion. With verify_peer on and
     /// no trust store match, the initiator side never publishes
     /// `notify_connect`. A two-second window catches a successful
-    /// handshake on the pre-fix path.
+    /// handshake — its absence is the assertion below.
     const bool any_initiator = wait_for([&] {
         std::lock_guard lk(harness.mu);
         for (auto role : harness.roles) {
@@ -405,12 +405,13 @@ TEST(TlsLink_Shutdown, SynchronousNotifyDisconnect) {
     client->shutdown();
     server->shutdown();
 
-    /// Caller-thread pin: pre-fix, every notify_disconnect would
-    /// either be dropped (handler poisoned by `ioc_.stop()`) or
-    /// run on the worker thread that drained an EOF before the
-    /// stop landed; either way `on_main_disconnects` stays zero.
-    /// Post-fix, both shutdown calls fire on the caller thread,
-    /// matching the two observed `notify_connect` events.
+    /// Caller-thread pin: both `shutdown()` calls fire
+    /// `notify_disconnect` on the caller thread before returning,
+    /// matching the two observed `notify_connect` events. Letting
+    /// `ioc_.stop()` race the worker-side EOF would otherwise
+    /// either drop the notify (handler poisoned by the stop) or
+    /// run it on the worker thread — either way the caller-thread
+    /// counter would stay at zero.
     EXPECT_EQ(harness.on_main_disconnects.load(), 2)
         << "TlsLink::shutdown() must fire notify_disconnect "
            "synchronously on the caller thread for every live "
