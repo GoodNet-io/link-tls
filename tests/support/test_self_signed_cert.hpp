@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-/// @file   tests/support/test_self_signed_cert.hpp
+/// @file   plugins/links/tls/tests/support/test_self_signed_cert.hpp
 /// @brief  In-memory self-signed RSA-2048 cert + key generator for
 ///         TLS-touching tests.
 ///
