@@ -603,8 +603,12 @@ gn_result_t TlsLink::listen(std::string_view uri) {
 
     /// Server cert + key must be loadable before bind; otherwise a
     /// peer's TLS handshake fails after socket connect, which is a
-    /// noisier failure than refusing to bind.
-    if (!load_server_credentials()) return GN_ERR_NOT_IMPLEMENTED;
+    /// noisier failure than refusing to bind. `INVALID_STATE` is the
+    /// honest code per `sdk/types.h`: the link is in the wrong phase
+    /// for the requested op (no credentials wired and no `host_api`
+    /// config bound yet). `NOT_IMPLEMENTED` previously misled the
+    /// caller into thinking the listen path itself was a stub.
+    if (!load_server_credentials()) return GN_ERR_INVALID_STATE;
 
     const auto parts = ::gn::parse_uri(uri);
     if (!parts || parts->scheme != "tls" || parts->is_path_style()) {

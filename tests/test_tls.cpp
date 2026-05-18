@@ -112,8 +112,11 @@ TEST(TlsLink, RejectsListenWithoutCredentials) {
     auto t = std::make_shared<gn::link::tls::TlsLink>();
     /// No credentials wired and no host_api / config bound — the
     /// listen path must refuse rather than silently accept and fail
-    /// every TLS handshake later.
-    EXPECT_EQ(t->listen("tls://127.0.0.1:0"), GN_ERR_NOT_IMPLEMENTED);
+    /// every TLS handshake later. `INVALID_STATE` per `sdk/types.h`
+    /// signals "callee in wrong phase for the requested op"; the
+    /// previous `NOT_IMPLEMENTED` falsely implied the listen path
+    /// itself was a stub.
+    EXPECT_EQ(t->listen("tls://127.0.0.1:0"), GN_ERR_INVALID_STATE);
     t->shutdown();
 }
 
